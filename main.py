@@ -6,7 +6,12 @@ from PIL import Image, UnidentifiedImageError
 import json
 import io
 import sys
-
+import os
+import base64
+import re
+import openai
+from dotenv import load_dotenv
+load_dotenv()
 app = FastAPI(title="Food Calorie Estimator API")
 
 app.add_middleware(
@@ -54,7 +59,7 @@ def _dense_compat_from_config(cls, config):
     return _orig_dense_from_config(cls, config)
 tf.keras.layers.Dense.from_config = classmethod(_dense_compat_from_config)
 
-# Load model
+# Load TensorFlow model
 print("Loading model...")
 try:
     model = tf.keras.models.load_model("food_model_v2.keras")
@@ -69,11 +74,44 @@ except FileNotFoundError:
     print("calorie_map.json not found")
     sys.exit(1)
 
+# OpenAI Vision client — only initialised when the env var is present
+_openai_api_key = os.environ.get("OPENAI_API_KEY")
+openai_client = openai.AsyncOpenAI(api_key=_openai_api_key) if _openai_api_key else None
+
+if openai_client:
+    print("✅ OpenAI Vision fallback enabled")
+else:
+    print("⚠️  OPENAI_API_KEY not set — OpenAI Vision fallback disabled")
+
 print("✅ Server ready!")
+
+# Prompt that instructs GPT-4o to return strict JSON only
+OPENAI_PROMPT = (
+    "You are a nutrition expert. Identify the food in this image.\n\n"
+    "Return ONLY a JSON object — no markdown, no code fences, no explanation.\n"
+    "The JSON must contain exactly these fields:\n"
+    '{\n'
+    '  "food_name": "Name of the food in title case",\n'
+    '  "confidence": 90,\n'
+    '  "calories": 250,\n'
+    '  "protein": 12,\n'
+    '  "carbs": 30,\n'
+    '  "fat": 8,\n'
+    '  "serving_size": "100g"\n'
+    '}\n\n'
+    "Rules:\n"
+    "- food_name: proper English name, title case\n"
+    "- confidence: integer 0-100 representing your certainty\n"
+    "- calories / protein / carbs / fat: integers per 100g serving\n"
+    "- serving_size: always the string \"100g\"\n"
+    "Return ONLY the JSON object, nothing else."
+)
+
 
 @app.get("/")
 def home():
-    return {"status": "Food Calorie API is running!"}
+    return {"status": "Food Calorie API is running!", "hybrid_mode": openai_client is not None}
+
 
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
@@ -82,6 +120,7 @@ async def predict(file: UploadFile = File(...)):
 
     contents = await file.read()
 
+    # ── Step 1: decode & preprocess image (unchanged) ────────────────────────
     try:
         img = Image.open(io.BytesIO(contents)).convert("RGB")
     except UnidentifiedImageError:
@@ -91,25 +130,100 @@ async def predict(file: UploadFile = File(...)):
     arr = np.array(img, dtype=np.float32)
     arr = np.expand_dims(arr, axis=0)
 
+    # ── Step 2: TensorFlow prediction (unchanged logic) ───────────────────────
     try:
         preds = model.predict(arr, verbose=0)[0]
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Model prediction failed: {e}")
 
     top3_indices = np.argsort(preds)[::-1][:3]
+    top_confidence = float(preds[top3_indices[0]]) * 100
 
-    results = []
+    # Build the TF result list exactly as before, just add source field
+    tf_results = []
     for idx in top3_indices:
-        food_name = CLASS_NAMES[idx]
+        food_key = CLASS_NAMES[idx]
         confidence = float(preds[idx]) * 100
-        nutrition = calorie_map.get(food_name, {})
-        results.append({
-            "food": food_name.replace("_", " ").title(),
+        nutrition = calorie_map.get(food_key, {})
+        tf_results.append({
+            "food":       food_key.replace("_", " ").title(),
             "confidence": round(confidence, 1),
-            "calories": nutrition.get("calories", "N/A"),
-            "protein": nutrition.get("protein", "N/A"),
-            "carbs": nutrition.get("carbs", "N/A"),
-            "fat": nutrition.get("fat", "N/A"),
+            "calories":   nutrition.get("calories", "N/A"),
+            "protein":    nutrition.get("protein",  "N/A"),
+            "carbs":      nutrition.get("carbs",    "N/A"),
+            "fat":        nutrition.get("fat",      "N/A"),
+            "source":     "tensorflow",
         })
 
-    return {"predictions": results}
+    print(f"TF Model: {tf_results[0]['food']} | Confidence: {top_confidence:.1f}%")
+
+    # ── Step 3: Hybrid decision ───────────────────────────────────────────────
+    if top_confidence >= 70.0:
+        print("✅ Using TensorFlow result")
+        return {"predictions": tf_results}
+    else:
+        print("⚠️ TF confidence low, switching to OpenAI Vision")
+
+    # TF confidence below threshold — try OpenAI Vision
+    if openai_client is None:
+        # No API key; return TF results as-is
+        return {"predictions": tf_results}
+
+    # ── Step 4: OpenAI Vision fallback ───────────────────────────────────────
+    try:
+        image_b64 = base64.standard_b64encode(contents).decode("utf-8")
+        # Normalise content-type to a valid MIME type for the data URL
+        ct = file.content_type
+        media_type = "image/jpeg" if ct in ("image/jpeg", "image/jpg") else ct
+
+        response = await openai_client.chat.completions.create(
+            model="gpt-4o",
+            max_tokens=512,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url":    f"data:{media_type};base64,{image_b64}",
+                                "detail": "low",
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": OPENAI_PROMPT,
+                        },
+                    ],
+                }
+            ],
+        )
+
+        response_text = response.choices[0].message.content.strip()
+
+        # Defensively strip markdown code fences if GPT-4o adds them
+        if response_text.startswith("```"):
+            response_text = re.sub(r"^```(?:json)?\s*", "", response_text)
+            response_text = re.sub(r"\s*```$", "", response_text.strip())
+
+        openai_data = json.loads(response_text)
+
+        # ── Step 5: return OpenAI result ──────────────────────────────────────
+        openai_result = {
+            "food":       str(openai_data.get("food_name", "Unknown Food")),
+            "confidence": float(openai_data.get("confidence", 80)),
+            "calories":   openai_data.get("calories",  "N/A"),
+            "protein":    openai_data.get("protein",   "N/A"),
+            "carbs":      openai_data.get("carbs",     "N/A"),
+            "fat":        openai_data.get("fat",       "N/A"),
+            "source":     "openai_vision",
+        }
+        print(f"✅ OpenAI Vision result: {openai_result['food']}")
+        return {"predictions": [openai_result]}
+
+    except Exception as e:
+        # OpenAI failed — fall back to TF results, flag the error
+        print(f"OpenAI Vision fallback failed: {e}")
+        for result in tf_results:
+            result["openai_error"] = True
+        return {"predictions": tf_results}
